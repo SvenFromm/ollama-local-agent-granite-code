@@ -1,0 +1,11 @@
+[project]
+name = "ollama-local-agent-granite-code"
+version = "0.3.0"
+description = "Local autonomous Python agent optimized for Granite Code through Ollama"
+requires-python = ">=3.14"
+license = "Apache-2.0"
+authors = [{ name = "Sven Fromm" }]
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/SvenFromm/ollama-local-agent-granite-code"

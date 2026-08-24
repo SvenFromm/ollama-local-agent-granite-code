@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import logging
 import sys
 from datetime import datetime
@@ -12,13 +13,19 @@ LOG_FILE = LOG_DIR / f"agent_{datetime.now():%Y%m%d_%H%M%S_%f}.log"
 logger = logging.getLogger("granite_agent")
 logger.setLevel(logging.DEBUG)
 logger.handlers.clear()
-formatter = logging.Formatter("%(asctime)s | %(levelname)-8s | %(threadName)s | %(name)s | %(message)s")
-fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
-fh.setLevel(logging.DEBUG)
-fh.setFormatter(formatter)
-ch = logging.StreamHandler(sys.stdout)
-ch.setLevel(logging.INFO)
-ch.setFormatter(formatter)
-logger.addHandler(fh)
-logger.addHandler(ch)
+
+formatter = logging.Formatter(
+    "%(asctime)s | %(levelname)-8s | %(threadName)s | %(name)s | %(message)s"
+)
+
+file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+file_handler.setLevel(logging.DEBUG)
+file_handler.setFormatter(formatter)
+
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(formatter)
+
+logger.addHandler(file_handler)
+logger.addHandler(console_handler)
 logger.propagate = False

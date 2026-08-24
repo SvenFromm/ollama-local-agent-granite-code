@@ -1,12 +1,20 @@
 # Contributing
 
-1. Create a feature branch.
-2. Keep tool functions deterministic and return dictionaries containing `ok`.
-3. Preserve workspace path restrictions for filesystem tools.
-4. Run the unit tests before committing:
+Contributions are welcome. Changes should preserve the project's core design: deterministic Python owns execution state and Granite handles only reasoning/transformation that benefits from an LLM.
+
+Before submitting a change:
+
+1. Keep tool behavior deterministic and return structured `{"ok": ...}` results.
+2. Preserve workspace path confinement for filesystem operations.
+3. Do not weaken shell or network policy without documenting the security consequence.
+4. Add a regression test for every real model/controller failure being fixed.
+5. Avoid moving model-specific protocol handling into concrete tools.
+6. Keep model prompts compact; prefer controller state over long conversational history.
+7. Run:
 
 ```bash
-python -m unittest discover -s tests -v
+python3 -m compileall -q .
+python3 -m unittest discover -s tests -v
 ```
 
-5. Keep Ollama/model calls out of unit tests unless a test is explicitly marked as an integration test.
+All tests must pass before a pull request is merged.

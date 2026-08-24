@@ -1,24 +1,25 @@
-# agent/supervisor.py
-
 from __future__ import annotations
 
-import ast
 import json
 import re
 import select
 import sys
 import uuid
-
-from pathlib import Path
+import xml.etree.ElementTree as ET
 from typing import Any
 
+from agent.action_parser import GraniteActionParser, ParsedAction
 from agent.config import Config
+from agent.direct_router import DirectRoute, natural_direct, parse_direct_call
 from agent.logging_setup import logger
 from agent.memory import MemoryStore
+from agent.objective import ObjectiveRequirements, analyze_objective, extract_url
 from agent.ollama import OllamaClient
-from agent.prompts import build_prompt
+from agent.prompts import build_action_prompt, build_transform_prompt
+from agent.security import shell_policy
 from agent.state import TaskState
 from agent.tool_registry import ToolRegistry
+from agent.workflow import WorkflowPolicy
 
 
 class Supervisor:
@@ -33,2103 +34,401 @@ class Supervisor:
         self.memory = memory
         self.tools = tools
         self.ollama = ollama
-
-        self.session_id = str(uuid.uuid4())
+        self.session_id = ""
         self.state: TaskState | None = None
-
-        self.required_read = False
-        self.required_write = False
-        self.required_web = False
-
-        self.target_write_path: str | None = None
-
-    # ================================================================
-    # MODEL RESPONSE PARSING
-    # ================================================================
-
-    @staticmethod
-    def _extract_json(
-        text: str,
-    ) -> dict[str, Any] | None:
-
-        text = text.strip()
-
-        text = re.sub(
-            r"^```(?:json)?\s*",
-            "",
-            text,
-            flags=re.I,
-        )
-
-        text = re.sub(
-            r"\s*```$",
-            "",
-            text,
-        )
-
-        try:
-            value = json.loads(text)
-
-            if isinstance(value, dict):
-                return value
-
-        except json.JSONDecodeError:
-            pass
-
-        decoder = json.JSONDecoder()
-
-        for index, character in enumerate(text):
-
-            if character != "{":
-                continue
-
-            try:
-                value, _ = decoder.raw_decode(
-                    text[index:]
-                )
-
-                if isinstance(value, dict):
-                    return value
-
-            except json.JSONDecodeError:
-                continue
-
-        return None
-
-    def _normalize(
-        self,
-        raw: dict[str, Any],
-    ) -> dict[str, Any] | None:
-
-        # Granite sometimes echoes observations.
-        if (
-            "action" not in raw
-            and "tool" in raw
-            and "result" in raw
-        ):
-            return None
-
-        action = (
-            raw.get("action")
-            or raw.get("tool")
-        )
-
-        if not isinstance(action, str):
-            return None
-
-        action = action.strip().lower()
-
-        aliases = {
-            "done": "complete",
-            "finish": "complete",
-            "finished": "complete",
-            "final": "complete",
-            "return": "complete",
-            "respond": "complete",
-            "response": "complete",
-        }
-
-        action = aliases.get(
-            action,
-            action,
-        )
-
-        if (
-            action == "tool"
-            and isinstance(raw.get("tool"), str)
-        ):
-            action = (
-                raw["tool"]
-                .strip()
-                .lower()
-            )
-
-        if action == "complete":
-
-            return {
-                "action": "complete",
-                "answer": str(
-                    raw.get("answer")
-                    or raw.get("result")
-                    or raw.get("summary")
-                    or raw.get("content")
-                    or ""
-                ),
-                "verification": str(
-                    raw.get("verification")
-                    or ""
-                ),
-            }
-
-        if action not in self.tools.names():
-            return None
-
-        arguments = raw.get(
-            "arguments",
-            {},
-        )
-
-        if not isinstance(arguments, dict):
-            arguments = {}
-
-        # Granite frequently nests arguments repeatedly.
-        for _ in range(8):
-
-            if (
-                set(arguments) == {"arguments"}
-                and isinstance(
-                    arguments["arguments"],
-                    dict,
-                )
-            ):
-                arguments = arguments["arguments"]
-
-            else:
-                break
-
-        if not arguments:
-
-            arguments = {
-                key: value
-                for key, value in raw.items()
-                if key
-                not in {
-                    "action",
-                    "tool",
-                    "result",
-                    "verification",
-                    "answer",
-                    "description",
-                    "parameters",
-                    "properties",
-                    "required",
-                    "type",
-                }
-            }
-
-        return {
-            "action": action,
-            "arguments": arguments,
-        }
-
-    # ================================================================
-    # OBJECTIVE ANALYSIS
-    # ================================================================
-
-    def _analyse_objective(
-        self,
-        objective: str,
-    ) -> None:
-
-        lower = objective.lower()
-
-        self.required_read = any(
-            token in lower
-            for token in (
-                "read ",
-                "summar",
-                "review",
-                "inspect",
-                "analy",
-                "analyse",
-                "analyze",
-            )
-        )
-
-        self.required_write = any(
-            token in lower
-            for token in (
-                "write",
-                "save",
-                "create file",
-                "new file",
-                "modify",
-                "update",
-                "edit",
-                "fix",
-                "change",
-            )
-        )
-
-        self.required_web = any(
-            token in lower
-            for token in (
-                "internet",
-                "website",
-                "http://",
-                "https://",
-                "online",
-                "web ",
-                "latest",
-                "current news",
-            )
-        )
-
-        self.target_write_path = (
-            self._extract_output_path(
-                objective
-            )
-        )
-
-        logger.info(
-            "OBJECTIVE ANALYSIS: "
-            "read=%s write=%s web=%s target=%s",
-            self.required_read,
-            self.required_write,
-            self.required_web,
-            self.target_write_path,
-        )
-
-    @staticmethod
-    def _extract_output_path(
-        objective: str,
-    ) -> str | None:
-
-        patterns = (
-            r"\b(?:new|output)\s+file\s+[\"']?([^\s\"']+\.[A-Za-z0-9]+)[\"']?",
-            r"\b(?:write|save|create)\s+(?:to\s+)?(?:file\s+)?[\"']?([^\s\"']+\.[A-Za-z0-9]+)[\"']?",
-            r"\bin\s+(?:a\s+)?(?:new\s+)?file\s+[\"']?([^\s\"']+\.[A-Za-z0-9]+)[\"']?",
-            r"\bto\s+(?:a\s+)?(?:new\s+)?file\s+[\"']?([^\s\"']+\.[A-Za-z0-9]+)[\"']?",
-        )
-
-        for pattern in patterns:
-
-            match = re.search(
-                pattern,
-                objective,
-                flags=re.I,
-            )
-
-            if match:
-
-                value = (
-                    match.group(1)
-                    .strip()
-                    .rstrip(".,;:")
-                )
-
-                if value:
-                    return value
-
-        return None
-
-    # ================================================================
-    # TASK STATE
-    # ================================================================
-
-    def _has_successful_tool(
-        self,
-        name: str,
-    ) -> bool:
-
-        assert self.state is not None
-
-        for observation in self.state.observations:
-
-            if observation.get("tool") != name:
-                continue
-
-            result = observation.get(
-                "result",
-                {},
-            )
-
-            if (
-                isinstance(result, dict)
-                and result.get("ok") is True
-            ):
-                return True
-
-        return False
-
-    def _successful_results(
-        self,
-        name: str,
-    ) -> list[dict[str, Any]]:
-
-        assert self.state is not None
-
-        results: list[dict[str, Any]] = []
-
-        for observation in self.state.observations:
-
-            if observation.get("tool") != name:
-                continue
-
-            result = observation.get(
-                "result",
-                {},
-            )
-
-            if (
-                isinstance(result, dict)
-                and result.get("ok") is True
-            ):
-                results.append(result)
-
-        return results
-
-    def _read_complete(
-        self,
-    ) -> bool:
-
-        if not self.required_read:
-            return True
-
-        assert self.state is not None
-
-        if not self.state.read_paths:
-            return False
-
-        # If the most recent successful read says more content exists,
-        # reading is not yet complete.
-        for observation in reversed(
-            self.state.observations
-        ):
-
-            if (
-                observation.get("tool")
-                != "read_file"
-            ):
-                continue
-
-            result = observation.get(
-                "result",
-                {},
-            )
-
-            if not isinstance(
-                result,
-                dict,
-            ):
-                continue
-
-            if not result.get("ok"):
-                continue
-
-            return not bool(
-                result.get("has_more")
-            )
-
-        return False
-
-    def _write_complete(
-        self,
-    ) -> bool:
-
-        if not self.required_write:
-            return True
-
-        assert self.state is not None
-
-        return bool(
-            self.state.written_paths
-        )
-
-    def _web_complete(
-        self,
-    ) -> bool:
-
-        if not self.required_web:
-            return True
-
-        assert self.state is not None
-
-        return bool(
-            self.state.fetched_urls
-        )
-
-    def _workflow_status(
-        self,
-    ) -> str:
-
-        read_status = (
-            "DONE"
-            if self._read_complete()
-            else "MISSING"
-        )
-
-        write_status = (
-            "DONE"
-            if self._write_complete()
-            else "MISSING"
-        )
-
-        web_status = (
-            "DONE"
-            if self._web_complete()
-            else "MISSING"
-        )
-
-        return (
-            "CONTROLLER WORKFLOW STATUS\n"
-            f"READ:  {read_status}\n"
-            f"WRITE: {write_status}\n"
-            f"WEB:   {web_status}\n"
-        )
-
-    # ================================================================
-    # DIRECT ROUTING
-    # ================================================================
-
-    @staticmethod
-    def _parse_direct_call(
-        task: str,
-    ) -> tuple[
-        str,
-        dict[str, Any],
-    ] | None:
-
-        match = re.fullmatch(
-            r"\s*"
-            r"(list_files|read_file)"
-            r"\s*\((.*)\)\s*",
-            task,
-            flags=re.S,
-        )
-
-        if not match:
-            return None
-
-        name, raw_args = match.groups()
-
-        raw_args = raw_args.strip()
-
-        if not raw_args:
-            return name, {}
-
-        try:
-
-            expression = ast.parse(
-                f"f({raw_args})",
-                mode="eval",
-            ).body
-
-            if not isinstance(
-                expression,
-                ast.Call,
-            ):
-                return None
-
-            arguments: dict[str, Any] = {}
-
-            if expression.args:
-
-                arguments["path"] = (
-                    ast.literal_eval(
-                        expression.args[0]
-                    )
-                )
-
-            for keyword in expression.keywords:
-
-                if keyword.arg:
-
-                    arguments[
-                        keyword.arg
-                    ] = ast.literal_eval(
-                        keyword.value
-                    )
-
-            return name, arguments
-
-        except Exception:
-
-            return (
-                name,
-                {
-                    "path": (
-                        raw_args
-                        .strip()
-                        .strip("\"'")
-                    )
-                },
-            )
-
-    @staticmethod
-    def _natural_direct(
-        task: str,
-    ) -> tuple[
-        str,
-        dict[str, Any],
-        bool,
-    ] | None:
-
-        text = re.sub(
-            r"\s+",
-            " ",
-            task.strip(),
-        )
-
-        lower = text.lower()
-
-        # Directory listing.
-        if (
-            re.fullmatch(
-                r"(?:list|show)"
-                r"(?: the)? "
-                r"(?:files|contents|content|directory contents|files and directories)"
-                r"(?: (?:of|in) (?:the )?"
-                r"(?:current |working |current working )?"
-                r"(?:folder|directory))?",
-                lower,
-            )
-            or lower
-            in {
-                "list current folder",
-                "list current directory",
-                "list files of current folder",
-                "list files in current folder",
-                "list files of current directory",
-                "list files in current directory",
-            }
-        ):
-
-            return (
-                "list_files",
-                {
-                    "path": ".",
-                    "recursive": False,
-                },
-                True,
-            )
-
-        # Explicit shell execution.
-        shell_match = re.fullmatch(
-            r"(?:execute|run)"
-            r"(?: (?:the )?"
-            r"(?:script|command|shell command))?"
-            r"\s+(.+)",
-            text,
-            flags=re.I,
-        )
-
-        if shell_match:
-
-            command = (
-                shell_match
-                .group(1)
-                .strip()
-            )
-
-            if command:
-
-                return (
-                    "run_shell",
-                    {
-                        "command": command
-                    },
-                    True,
-                )
-
-        # Simple file read.
-        read_match = re.fullmatch(
-            r"(?:read|show|display)"
-            r"(?: file)?\s+(.+)",
-            text,
-            flags=re.I,
-        )
-
-        if (
-            read_match
-            and not re.search(
-                r"\b("
-                r"summar|analys|review|then|"
-                r"write|save|create|modify|"
-                r"update|edit|fix|change"
-                r")\w*\b",
-                lower,
-            )
-        ):
-
-            path = (
-                read_match
-                .group(1)
-                .strip()
-                .strip("\"'")
-            )
-
-            return (
-                "read_file",
-                {
-                    "path": path
-                },
-                True,
-            )
-
-        return None
-
-    # ================================================================
-    # SHELL POLICY
-    # ================================================================
-
-    @staticmethod
-    def _shell_allowed(
-        command: str,
-        objective: str,
-    ) -> tuple[
-        bool,
-        str,
-    ]:
-
-        lowered = command.lower()
-
-        dangerous = (
-            "sudo ",
-            "apt ",
-            "apt-get ",
-            "dnf ",
-            "yum ",
-            "pacman ",
-            "mkfs",
-            "dd if=",
-            "shutdown",
-            "reboot",
-            "poweroff",
-            "rm -rf /",
-        )
-
-        if any(
-            token in lowered
-            for token in dangerous
-        ):
-
-            objective_lower = (
-                objective.lower()
-            )
-
-            if not any(
-                token.strip()
-                in objective_lower
-                for token in dangerous
-            ):
-
-                return (
-                    False,
-                    "privileged/package/"
-                    "destructive command was "
-                    "not explicitly requested",
-                )
-
-        return True, ""
-
-    # ================================================================
-    # PHASE-SPECIFIC TOOL POLICY
-    # ================================================================
-
-    def _allowed_tools(
-        self,
-    ) -> set[str]:
-
-        assert self.state is not None
-
-        available = set(
-            self.tools.names()
-        )
-
-        # Network task has not yet fetched data.
-        if (
-            self.required_web
-            and not self._web_complete()
-        ):
-            return (
-                {"curl_internet"}
-                & available
-            )
-
-        # File-reading stage.
-        if (
-            self.required_read
-            and not self._read_complete()
-        ):
-            return (
-                {
-                    "read_file",
-                    "list_files",
-                }
-                & available
-            )
-
-        # IMPORTANT:
-        # Once reading is complete, read_file is deliberately removed.
-        # Granite 3B cannot get stuck repeatedly reading the same source.
-        if (
-            self.required_write
-            and not self._write_complete()
-        ):
-            return (
-                {
-                    "write_file",
-                    "append_file",
-                }
-                & available
-            )
-
-        # Verification stage.
-        if (
-            self.required_write
-            and self._write_complete()
-        ):
-            return (
-                {"read_file"}
-                & available
-            )
-
-        return available
-
-    # ================================================================
-    # COMPLETION
-    # ================================================================
-
-    def _completion_valid(
-        self,
-        answer: str,
-    ) -> tuple[
-        bool,
-        str,
-    ]:
-
-        if (
-            self.required_read
-            and not self._read_complete()
-        ):
-
-            return (
-                False,
-                "Completion rejected: "
-                "the required source file "
-                "has not been completely read.",
-            )
-
-        if (
-            self.required_write
-            and not self._write_complete()
-        ):
-
-            return (
-                False,
-                "Completion rejected: "
-                "the objective requires writing "
-                "an output file but no successful "
-                "write has occurred.",
-            )
-
-        if (
-            self.required_web
-            and not self._web_complete()
-        ):
-
-            return (
-                False,
-                "Completion rejected: "
-                "the objective requires network "
-                "retrieval but no successful "
-                "network request occurred.",
-            )
-
-        if not answer.strip():
-
-            return (
-                False,
-                "Completion rejected: "
-                "answer is empty.",
-            )
-
-        return True, ""
-
-    # ================================================================
-    # RESULT OUTPUT
-    # ================================================================
-
-    @staticmethod
-    def _simple_answer(
-        tool: str,
-        result: dict[str, Any],
-    ) -> str:
-
-        if tool == "list_files":
-
-            files = result.get(
-                "files",
-                [],
-            )
-
-            if isinstance(files, list):
-
-                return "\n".join(
-                    str(item)
-                    for item in files
-                )
-
-        if (
-            tool == "read_file"
-            and isinstance(
-                result.get("content"),
-                str,
-            )
-        ):
-            return result["content"]
-
-        if (
-            tool == "curl_internet"
-            and isinstance(
-                result.get("body"),
-                str,
-            )
-        ):
-            return result["body"]
-
-        return json.dumps(
-            result,
-            indent=2,
-            ensure_ascii=False,
-            default=str,
-        )
-
-    @staticmethod
-    def _print_result(
-        name: str,
-        result: dict[str, Any],
-    ) -> None:
-
+        self.requirements = ObjectiveRequirements()
+        self.workflow = WorkflowPolicy(self.requirements)
+        self.parser = GraniteActionParser(self.tools.names())
+        # Cached Python representation used to build a stable action-prompt prefix.
+        self._full_tool_catalog = self.tools.compact_catalog()
+
+    def _reset(self, objective: str) -> None:
+        self.session_id = str(uuid.uuid4())
+        self.state = TaskState(objective=objective)
+        self.requirements = analyze_objective(objective)
+        self.workflow = WorkflowPolicy(self.requirements)
+        self.parser = GraniteActionParser(self.tools.names())
+
+    def _compact_prompt(self, prompt: str) -> str:
+        if len(prompt) <= self.config.max_context_chars:
+            return prompt
+        head_budget = min(14000, self.config.max_context_chars // 3)
+        tail_budget = self.config.max_context_chars - head_budget - 80
+        return prompt[:head_budget] + "\n...[CONTEXT COMPACTED BY CONTROLLER]...\n" + prompt[-max(0, tail_budget):]
+
+    def _interrupt(self) -> bool:
+        timeout = self.config.interrupt_timeout
         print(
-            "\n"
-            + "-" * 72
-        )
-
-        print(
-            f"{name} OUTPUT"
-        )
-
-        print(
-            "-" * 72
-        )
-
-        field = None
-
-        if name == "read_file":
-            field = "content"
-
-        elif name == "curl_internet":
-            field = "body"
-
-        if (
-            field
-            and isinstance(
-                result.get(field),
-                str,
-            )
-        ):
-
-            print(
-                result[field]
-            )
-
-            metadata = {
-                key: value
-                for key, value
-                in result.items()
-                if key != field
-            }
-
-            print()
-
-            print(
-                json.dumps(
-                    metadata,
-                    indent=2,
-                    ensure_ascii=False,
-                    default=str,
-                )
-            )
-
-        else:
-
-            print(
-                json.dumps(
-                    result,
-                    indent=2,
-                    ensure_ascii=False,
-                    default=str,
-                )
-            )
-
-        print(
-            "-" * 72
-        )
-
-    # ================================================================
-    # INTERRUPT
-    # ================================================================
-
-    def _interrupt(
-        self,
-    ) -> bool:
-
-        timeout = (
-            self.config.interrupt_timeout
-        )
-
-        print(
-            "\n"
-            "[Enter]=continue | "
-            "stop | state | instruction "
-            f"[auto-continue in {timeout}s]> ",
+            f"\n[Enter]=continue | stop | state | instruction [auto-continue in {timeout}s]> ",
             end="",
             flush=True,
         )
-
         try:
-
-            readable, _, _ = (
-                select.select(
-                    [sys.stdin],
-                    [],
-                    [],
-                    timeout,
-                )
-            )
-
+            readable, _, _ = select.select([sys.stdin], [], [], timeout)
         except Exception:
-
             print()
             return True
-
         if not readable:
-
             print()
-
-            logger.info(
-                "ITERATION INTERRUPT: "
-                "%ss timeout -> continue",
-                timeout,
-            )
-
+            logger.info("ITERATION INTERRUPT: %ss timeout -> continue", timeout)
             return True
-
         line = sys.stdin.readline()
-
         if not line:
-
             print()
             return True
-
         command = line.strip()
-
         if not command:
             return True
-
-        if command.lower() in {
-            "stop",
-            "quit",
-            "exit",
-        }:
+        if command.lower() in {"stop", "quit", "exit"}:
             return False
-
         if command.lower() == "state":
-
-            state_data = (
-                self.state.__dict__
-                if self.state
-                else {}
-            )
-
-            print(
-                json.dumps(
-                    state_data,
-                    indent=2,
-                    ensure_ascii=False,
-                    default=list,
-                )
-            )
-
-            print(
-                self._workflow_status()
-            )
-
+            assert self.state is not None
+            print(json.dumps(self.state.__dict__, indent=2, ensure_ascii=False, default=list))
             return self._interrupt()
-
         assert self.state is not None
-
-        self.state.objective += (
-            "\nAdditional user instruction: "
-            + command
-        )
-
-        self._analyse_objective(
-            self.state.objective
-        )
-
+        self.state.objective += "\nAdditional user instruction: " + command
+        self.requirements = analyze_objective(self.state.objective)
+        self.workflow = WorkflowPolicy(self.requirements)
         return True
 
-    # ================================================================
-    # READ PAGINATION
-    # ================================================================
-
-    def _next_read_page(
-        self,
-        tool: str,
-        arguments: dict[str, Any],
-    ) -> dict[str, Any]:
-
-        assert self.state is not None
-
-        if (
-            tool != "read_file"
-            or not isinstance(
-                arguments.get("path"),
-                str,
-            )
-        ):
-            return arguments
-
-        if "start_line" in arguments:
-            return arguments
-
-        path = arguments["path"]
-
-        for observation in reversed(
-            self.state.observations
-        ):
-
-            if (
-                observation.get("tool")
-                != "read_file"
-            ):
-                continue
-
-            previous_args = (
-                observation.get(
-                    "arguments",
-                    {},
-                )
-            )
-
-            result = (
-                observation.get(
-                    "result",
-                    {},
-                )
-            )
-
-            if (
-                previous_args.get("path")
-                != path
-                or not isinstance(
-                    result,
-                    dict,
-                )
-            ):
-                continue
-
-            if (
-                result.get("ok")
-                and result.get("has_more")
-                and result.get("next_line")
-            ):
-
-                adjusted = dict(
-                    arguments
-                )
-
-                start = int(
-                    result["next_line"]
-                )
-
-                adjusted[
-                    "start_line"
-                ] = start
-
-                adjusted[
-                    "end_line"
-                ] = (
-                    start + 799
-                )
-
-                logger.info(
-                    "AUTO-PAGINATED "
-                    "read_file %s -> "
-                    "lines %s-%s",
-                    path,
-                    start,
-                    adjusted["end_line"],
-                )
-
-                return adjusted
-
-            break
-
-        return arguments
-
-    # ================================================================
-    # TOOL EXECUTION
-    # ================================================================
-
-    def _execute(
-        self,
-        tool: str,
-        arguments: dict[str, Any],
-    ) -> dict[str, Any]:
-
-        assert self.state is not None
-
-        arguments = (
-            self._next_read_page(
-                tool,
-                arguments,
-            )
-        )
-
+    @staticmethod
+    def _simple_answer(tool: str, result: dict[str, Any]) -> str:
+        if tool == "list_files" and isinstance(result.get("files"), list):
+            return "\n".join(str(item) for item in result["files"])
+        if tool == "read_file" and isinstance(result.get("content"), str):
+            return result["content"]
         if tool == "run_shell":
+            stdout = result.get("stdout")
+            if isinstance(stdout, str) and stdout:
+                return stdout.rstrip("\n")
+        if tool == "curl_internet" and isinstance(result.get("body"), str):
+            return result["body"]
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
 
-            allowed, reason = (
-                self._shell_allowed(
-                    str(
-                        arguments.get(
-                            "command",
-                            "",
-                        )
-                    ),
-                    self.state.objective,
-                )
-            )
+    @staticmethod
+    def _print_result(name: str, result: dict[str, Any]) -> None:
+        print("\n" + "-" * 72)
+        print(f"{name} OUTPUT")
+        print("-" * 72)
+        field = "content" if name == "read_file" else "body" if name == "curl_internet" else None
+        if field and isinstance(result.get(field), str):
+            print(result[field])
+            metadata = {key: value for key, value in result.items() if key != field}
+            print("\n" + json.dumps(metadata, indent=2, ensure_ascii=False, default=str))
+        else:
+            print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
+        print("-" * 72)
 
-            if not allowed:
-
+    def _execute(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        assert self.state is not None
+        if tool == "run_shell":
+            decision = shell_policy(str(arguments.get("command", "")), self.state.objective)
+            if not decision.allowed:
                 result = {
                     "ok": False,
                     "tool": tool,
-                    "error": (
-                        "Controller blocked "
-                        f"command: {reason}"
-                    ),
+                    "error": f"Controller blocked command: {decision.reason}",
+                    "controller_blocked": True,
                 }
-
-                self.state.record(
-                    tool,
-                    arguments,
-                    result,
-                    self.config.max_result_chars,
-                )
-
+                self.state.record(tool, arguments, result, self.config.max_result_chars)
                 return result
-
-        # Duplicate reads are allowed only when automatic pagination
-        # changed the arguments.
-        if self.state.repeated(
-            tool,
-            arguments,
-            limit=1,
-        ):
-
+        if self.state.repeated(tool, arguments, limit=1):
             result = {
                 "ok": False,
                 "tool": tool,
-                "error": (
-                    "Controller blocked "
-                    "identical non-progressing "
-                    "action."
-                ),
+                "error": "Controller blocked identical non-progressing action.",
                 "controller_blocked": True,
             }
-
-            self.state.record(
-                tool,
-                arguments,
-                result,
-                self.config.max_result_chars,
-            )
-
+            self.state.record(tool, arguments, result, self.config.max_result_chars)
             return result
-
-        logger.info(
-            "TOOL CALL: %s %s",
-            tool,
-            json.dumps(
-                arguments,
-                ensure_ascii=False,
-                default=str,
-            ),
-        )
-
-        result = self.tools.execute(
-            tool,
-            arguments,
-        )
-
+        if self.state.tool_calls >= self.config.max_tool_calls:
+            result = {"ok": False, "tool": tool, "error": "Maximum tool-call limit reached."}
+            self.state.record(tool, arguments, result, self.config.max_result_chars)
+            return result
+        result = self.tools.execute(tool, arguments)
         self.state.tool_calls += 1
-
-        self.state.record(
-            tool,
-            arguments,
-            result,
-            self.config.max_result_chars,
-        )
-
-        logger.info(
-            "TOOL RESULT: %s | ok=%s",
-            tool,
-            result.get("ok"),
-        )
-
-        if (
-            result.get("ok")
-            and tool
-            in {
-                "write_file",
-                "append_file",
-            }
-            and isinstance(
-                arguments.get("path"),
-                str,
-            )
-        ):
-
-            path = arguments["path"]
-
-            self.memory.remember_file(
-                path
-            )
-
-            # Controller performs verification itself.
-            verify_args = {
-                "path": path,
-                "start_line": 1,
-                "end_line": 160,
-            }
-
-            logger.info(
-                "CONTROLLER VERIFY WRITE: %s",
-                path,
-            )
-
-            verify = self.tools.execute(
-                "read_file",
-                verify_args,
-            )
-
-            self.state.tool_calls += 1
-
-            self.state.record(
-                "read_file",
-                verify_args,
-                verify,
-                self.config.max_result_chars,
-            )
-
-            result[
-                "controller_verification"
-            ] = {
-                key: value
-                for key, value
-                in verify.items()
-                if key != "content"
-            }
-
+        self.state.record(tool, arguments, result, self.config.max_result_chars)
+        if result.get("ok") and tool in {"write_file", "append_file"} and isinstance(arguments.get("path"), str):
+            self.memory.remember_file(arguments["path"])
         return result
 
-    # ================================================================
-    # CONTROLLER HINT
-    # ================================================================
-
-    def _controller_hint(
-        self,
-    ) -> str:
-
+    def _read_source_pages(self, path: str) -> dict[str, Any]:
         assert self.state is not None
+        start = 1
+        last_result: dict[str, Any] = {"ok": False, "error": "No read attempted"}
+        while self.state.tool_calls < self.config.max_tool_calls:
+            arguments = {"path": path, "start_line": start, "end_line": start + 799}
+            last_result = self._execute("read_file", arguments)
+            self._print_result("read_file", last_result)
+            if not last_result.get("ok") or not last_result.get("has_more"):
+                return last_result
+            next_line = last_result.get("next_line")
+            if not isinstance(next_line, int) or next_line <= start:
+                return {"ok": False, "tool": "read_file", "error": "Invalid read pagination state"}
+            start = next_line
+        return last_result
 
-        parts = [
-            self._workflow_status()
-        ]
+    def _verified_source_text(self, tool: str, field: str) -> str:
+        assert self.state is not None
+        chunks: list[str] = []
+        for observation in self.state.observations:
+            if observation.get("tool") != tool:
+                continue
+            result = observation.get("result")
+            if not isinstance(result, dict) or result.get("ok") is not True:
+                continue
+            value = result.get(field)
+            if isinstance(value, str) and value:
+                if tool == "read_file":
+                    value = re.sub(r"(?m)^\s*\d+\s+\|\s?", "", value)
+                chunks.append(value)
+        return "\n".join(chunks)
 
-        if (
-            self.required_read
-            and not self._read_complete()
-        ):
+    def _verify_write(self, path: str) -> dict[str, Any]:
+        assert self.state is not None
+        arguments = {"path": path, "start_line": 1, "end_line": 160}
+        result = self.tools.execute("read_file", arguments)
+        self.state.tool_calls += 1
+        self.state.record("read_file", arguments, result, self.config.max_result_chars)
+        logger.info("CONTROLLER WRITE VERIFICATION: %s | ok=%s", path, result.get("ok"))
+        return result
 
-            parts.append(
-                "NEXT REQUIRED PHASE: READ\n"
-                "Read the required source file. "
-                "Do not write or complete yet."
-            )
+    def _complete_verified_write(self, path: str) -> str | None:
+        assert self.state is not None
+        verification = self._verify_write(path)
+        if not verification.get("ok"):
+            return None
+        answer = f"Created {path}" if self.requirements.write_mode != "append" else f"Updated {path}"
+        self.state.completed = True
+        self.state.final_answer = answer
+        self.state.verification = "write succeeded and controller read-back verification succeeded"
+        self.memory.remember_task(self.state.objective, answer)
+        logger.info("TASK COMPLETE: controller-verified write")
+        print(f"\n{answer}\n\nVerification: {self.state.verification}")
+        return answer
 
-        elif (
-            self.required_write
-            and not self._write_complete()
-        ):
-
-            target = (
-                self.target_write_path
-                or "the output file requested "
-                "by the user"
-            )
-
-            parts.append(
-                "NEXT REQUIRED PHASE: WRITE\n"
-                "The source has already been "
-                "successfully read.\n"
-                "DO NOT call read_file again.\n"
-                "Use the source content already "
-                "present in the observations.\n"
-                f"Write the transformed result to: "
-                f"{target}\n"
-                "Your next action must use "
-                "write_file or append_file.\n"
-                "Do not claim completion until "
-                "the write succeeds."
-            )
-
-        elif (
-            self.required_web
-            and not self._web_complete()
-        ):
-
-            parts.append(
-                "NEXT REQUIRED PHASE: FETCH\n"
-                "Perform the required network "
-                "request."
-            )
-
+    def _write_generated_content(self, source_text: str | None = None) -> str | None:
+        assert self.state is not None
+        path = self.requirements.output_path
+        if not path:
+            return None
+        if self.requirements.literal_content is not None:
+            content = self.requirements.literal_content
+            logger.info("CONTROLLER LITERAL CONTENT ROUTE: %s", path)
         else:
+            bounded_source = None
+            if source_text is not None:
+                bounded_source = source_text[: self.config.max_transform_input_chars]
+                if len(source_text) > len(bounded_source):
+                    bounded_source += "\n...[SOURCE TRUNCATED BY CONTROLLER]..."
+            prompt = build_transform_prompt(self.state.objective, bounded_source)
+            logger.info("CONTROLLER TRANSFORM ROUTE: prompt_chars=%s", len(prompt))
+            content = self.ollama.generate_text(prompt, self.config.transform_num_predict).strip()
+            if not content:
+                logger.warning("TRANSFORMATION RETURNED EMPTY CONTENT")
+                return None
+        tool = "append_file" if self.requirements.write_mode == "append" else "write_file"
+        result = self._execute(tool, {"path": path, "content": content})
+        self._print_result(tool, result)
+        if result.get("ok"):
+            return self._complete_verified_write(path)
+        return None
 
-            parts.append(
-                "All controller-required "
-                "operations have succeeded.\n"
-                "Return complete using only "
-                "verified evidence."
-            )
+    @staticmethod
+    def _rss_headlines(body: str, limit: int = 10) -> str | None:
+        try:
+            root = ET.fromstring(body)
+        except ET.ParseError:
+            return None
+        items = root.findall(".//item")
+        if not items:
+            return None
+        lines: list[str] = []
+        for index, item in enumerate(items[:limit], start=1):
+            title = (item.findtext("title") or "").strip()
+            description = re.sub(r"<[^>]+>", "", (item.findtext("description") or "")).strip()
+            if not title:
+                continue
+            lines.append(f"{index}. {title}")
+            if description and description != title:
+                lines.append(f"   {description}")
+        return "\n".join(lines) if lines else None
 
-        return "\n\n".join(
-            parts
+    def _fetch_web_source(self) -> dict[str, Any]:
+        assert self.state is not None
+        explicit_url = extract_url(self.state.objective)
+        url = explicit_url or self.config.default_news_url
+        logger.info("CONTROLLER WEB ROUTE: %s", url)
+        result = self._execute("curl_internet", {"url": url})
+        self._print_result("curl_internet", result)
+        return result
+
+    def _run_direct(self, route: DirectRoute) -> str:
+        result = self._execute(route.tool, route.arguments)
+        self._print_result(route.tool, result)
+        if result.get("ok") and route.complete_after_success:
+            answer = self._simple_answer(route.tool, result)
+            assert self.state is not None
+            self.state.completed = True
+            self.state.final_answer = answer
+            self.state.verification = f"{route.tool} returned ok=true"
+            self.memory.remember_task(self.state.objective, answer[:2000])
+            logger.info("TASK COMPLETE: direct route")
+            return answer
+        return self._autonomous_loop(initial_hint=f"Direct action failed: {result.get('error', 'unknown error')}")
+
+    def _model_action(self, hint: str) -> ParsedAction | None:
+        assert self.state is not None
+        allowed = self.workflow.allowed_tools(self.state, self.tools.names())
+        prompt = build_action_prompt(
+            self.state,
+            self._full_tool_catalog,
+            allowed,
+            self.memory.prompt_context(3),
+            self.workflow.hint(self.state) + (f" Additional instruction: {hint}" if hint else ""),
         )
+        logger.info("ACTION PROMPT chars=%s allowed=%s", len(prompt), sorted(allowed))
+        raw_text = self.ollama.generate(self._compact_prompt(prompt), self.config.action_num_predict)
+        logger.debug("RAW MODEL OUTPUT: %s", raw_text)
+        return self.parser.parse(raw_text)
 
-    # ================================================================
-    # MAIN AGENT LOOP
-    # ================================================================
+    def _autonomous_loop(self, initial_hint: str = "") -> str:
+        assert self.state is not None
+        hint = initial_hint
+        last_signature: str | None = None
+        nonprogress = 0
 
-    def run(
-        self,
-        objective: str,
-    ) -> str:
-
-        self.session_id = str(
-            uuid.uuid4()
-        )
-
-        self.state = TaskState(
-            objective=objective
-        )
-
-        self._analyse_objective(
-            objective
-        )
-
-        logger.info(
-            "=" * 72
-        )
-
-        logger.info(
-            "GRANITE CODE AGENT TASK | "
-            "session=%s",
-            self.session_id,
-        )
-
-        logger.info(
-            "Objective: %s",
-            objective,
-        )
-
-        logger.info(
-            "Workspace: %s",
-            self.config.workspace,
-        )
-
-        logger.info(
-            "Required workflow: "
-            "read=%s write=%s web=%s",
-            self.required_read,
-            self.required_write,
-            self.required_web,
-        )
-
-        logger.info(
-            "=" * 72
-        )
-
-        # ------------------------------------------------------------
-        # Exact direct tool syntax
-        # ------------------------------------------------------------
-
-        direct_call = (
-            self._parse_direct_call(
-                objective
-            )
-        )
-
-        if direct_call:
-
-            name, arguments = (
-                direct_call
-            )
-
-            result = self._execute(
-                name,
-                arguments,
-            )
-
-            self._print_result(
-                name,
-                result,
-            )
-
-            return self._simple_answer(
-                name,
-                result,
-            )
-
-        # ------------------------------------------------------------
-        # Deterministic trivial requests
-        # ------------------------------------------------------------
-
-        natural = (
-            self._natural_direct(
-                objective
-            )
-        )
-
-        if natural:
-
-            (
-                name,
-                arguments,
-                complete_after_success,
-            ) = natural
-
+        for iteration in range(1, self.config.max_iterations + 1):
+            self.state.iteration = iteration
+            self.state.phase = "planning" if iteration == 1 else "replanning"
+            allowed = self.workflow.allowed_tools(self.state, self.tools.names())
+            logger.info("-" * 72)
             logger.info(
-                "DIRECT ROUTER: %s %s",
-                name,
-                json.dumps(
-                    arguments,
-                    ensure_ascii=False,
-                ),
-            )
-
-            result = self._execute(
-                name,
-                arguments,
-            )
-
-            self._print_result(
-                name,
-                result,
-            )
-
-            if (
-                result.get("ok")
-                and complete_after_success
-            ):
-
-                answer = (
-                    self._simple_answer(
-                        name,
-                        result,
-                    )
-                )
-
-                self.state.completed = True
-                self.state.final_answer = answer
-
-                self.state.verification = (
-                    f"{name} returned ok=true."
-                )
-
-                self.memory.remember_task(
-                    objective,
-                    answer[:2000],
-                )
-
-                logger.info(
-                    "TASK COMPLETE: "
-                    "direct route"
-                )
-
-                return answer
-
-            self.state.phase = (
-                "replanning"
-            )
-
-        # ------------------------------------------------------------
-        # Autonomous loop
-        # ------------------------------------------------------------
-
-        hint = (
-            self._controller_hint()
-        )
-
-        last_model_action_signature: (
-            str | None
-        ) = None
-
-        repeated_model_actions = 0
-
-        for iteration in range(
-            1,
-            self.config.max_iterations + 1,
-        ):
-
-            self.state.iteration = (
-                iteration
-            )
-
-            if (
-                self.state.tool_calls
-                >= self.config.max_tool_calls
-            ):
-
-                hint = (
-                    self._controller_hint()
-                    + "\n\n"
-                    "TOOL CALL LIMIT REACHED.\n"
-                    "Do not call another tool. "
-                    "Complete using verified "
-                    "evidence if possible."
-                )
-
-            logger.info(
-                "-" * 72
-            )
-
-            logger.info(
-                "ITERATION %s/%s | "
-                "PHASE=%s | "
-                "TOOLS=%s/%s",
+                "ITERATION %s/%s | PHASE=%s | TOOLS=%s/%s | ALLOWED=%s",
                 iteration,
                 self.config.max_iterations,
                 self.state.phase,
                 self.state.tool_calls,
                 self.config.max_tool_calls,
-            )
-
-            logger.info(
-                "WORKFLOW: read=%s "
-                "write=%s web=%s",
-                self._read_complete(),
-                self._write_complete(),
-                self._web_complete(),
-            )
-
-            allowed = (
-                self._allowed_tools()
-            )
-
-            logger.info(
-                "ALLOWED TOOLS: %s",
                 sorted(allowed),
             )
-
-            controller_hint = (
-                self._controller_hint()
-            )
-
-            if hint:
-
-                controller_hint += (
-                    "\n\n"
-                    "ADDITIONAL CONTROLLER "
-                    "INSTRUCTION:\n"
-                    + hint
-                )
-
-            prompt = build_prompt(
-                self.state,
-                self.tools.compact_catalog(
-                    allowed
-                ),
-                self.memory.recent(8),
-                controller_hint,
-            )
-
-            if (
-                len(prompt)
-                > self.config.max_context_chars
-            ):
-
-                head_size = min(
-                    12000,
-                    self.config.max_context_chars
-                    // 2,
-                )
-
-                head = prompt[
-                    :head_size
-                ]
-
-                tail_budget = (
-                    self.config.max_context_chars
-                    - len(head)
-                    - 60
-                )
-
-                prompt = (
-                    head
-                    + "\n"
-                    "...[CONTEXT COMPACTED "
-                    "BY CONTROLLER]...\n"
-                    + prompt[
-                        -max(
-                            0,
-                            tail_budget,
-                        ):
-                    ]
-                )
-
-            raw_text = (
-                self.ollama.generate(
-                    prompt
-                )
-            )
-
-            logger.debug(
-                "RAW MODEL OUTPUT: %s",
-                raw_text,
-            )
-
-            raw = self._extract_json(
-                raw_text
-            )
-
-            action = (
-                self._normalize(raw)
-                if raw
-                else None
-            )
-
-            # --------------------------------------------------------
-            # Invalid model output
-            # --------------------------------------------------------
-
+            action = self._model_action(hint)
             if action is None:
-
-                hint = (
-                    "Your previous response was "
-                    "invalid. Return exactly one "
-                    "fresh JSON action. "
-                    "Use one of the currently "
-                    "allowed tool names or "
-                    "'complete'. Do not echo "
-                    "tool results."
-                )
-
-                logger.warning(
-                    "INVALID GRANITE ACTION: %s",
-                    raw_text[:1000],
-                )
-
-                if not self._interrupt():
-                    break
-
-                continue
-
-            # --------------------------------------------------------
-            # Detect model-level loops
-            # --------------------------------------------------------
-
-            action_signature = (
-                json.dumps(
-                    action,
-                    sort_keys=True,
-                    ensure_ascii=False,
-                    default=str,
-                )
-            )
-
-            if (
-                action_signature
-                == last_model_action_signature
-            ):
-
-                repeated_model_actions += 1
-
+                nonprogress += 1
+                hint = "Previous response was invalid. Choose one allowed action."
             else:
-
-                repeated_model_actions = 0
-
-            last_model_action_signature = (
-                action_signature
-            )
-
-            if (
-                repeated_model_actions
-                >= 2
-            ):
-
-                hint = (
-                    "MODEL LOOP DETECTED.\n"
-                    "The previous action has "
-                    "already been attempted.\n"
-                    + self._controller_hint()
-                )
-
-                logger.warning(
-                    "MODEL LOOP DETECTED: %s",
-                    action_signature,
-                )
-
-                if not self._interrupt():
-                    break
-
-                continue
-
-            # --------------------------------------------------------
-            # Completion request
-            # --------------------------------------------------------
-
-            if (
-                action["action"]
-                == "complete"
-            ):
-
-                valid, reason = (
-                    self._completion_valid(
-                        action["answer"]
-                    )
-                )
-
-                if valid:
-
-                    self.state.completed = True
-
-                    self.state.final_answer = (
-                        action["answer"]
-                    )
-
-                    self.state.verification = (
-                        action[
-                            "verification"
-                        ]
-                    )
-
-                    self.memory.remember_task(
-                        objective,
-                        self.state.final_answer,
-                    )
-
-                    logger.info(
-                        "TASK COMPLETE"
-                    )
-
-                    print(
-                        "\n"
-                        + self.state.final_answer
-                    )
-
-                    if (
-                        self.state.verification
-                    ):
-
-                        print(
-                            "\nVerification: "
-                            + self.state.verification
-                        )
-
-                    return (
-                        self.state.final_answer
-                    )
-
-                # Granite tried to finish before the workflow was done.
-                hint = (
-                    reason
-                    + "\n\n"
-                    + self._controller_hint()
-                )
-
-                logger.warning(
-                    "%s",
-                    reason,
-                )
-
-                if not self._interrupt():
-                    break
-
-                continue
-
-            # --------------------------------------------------------
-            # Tool request
-            # --------------------------------------------------------
-
-            tool = action["action"]
-
-            arguments = action.get(
-                "arguments",
-                {},
-            )
-
-            # If Granite omitted the target path during the write stage,
-            # insert the controller-derived output path.
-            if (
-                tool
-                in {
-                    "write_file",
-                    "append_file",
-                }
-                and self.target_write_path
-                and not arguments.get("path")
-            ):
-
-                arguments = dict(
-                    arguments
-                )
-
-                arguments["path"] = (
-                    self.target_write_path
-                )
-
-                logger.info(
-                    "CONTROLLER INSERTED "
-                    "WRITE TARGET: %s",
-                    self.target_write_path,
-                )
-
-            # --------------------------------------------------------
-            # Enforce phase-specific tool whitelist
-            # --------------------------------------------------------
-
-            if tool not in allowed:
-
-                hint = (
-                    f"Tool '{tool}' is forbidden "
-                    "during the current workflow "
-                    "phase.\n"
-                    f"Allowed tools: "
-                    f"{sorted(allowed)}\n\n"
-                    + self._controller_hint()
-                )
-
-                logger.warning(
-                    "TOOL BLOCKED BY "
-                    "TASK POLICY: %s",
-                    tool,
-                )
-
-                if not self._interrupt():
-                    break
-
-                continue
-
-            # --------------------------------------------------------
-            # Execute
-            # --------------------------------------------------------
-
-            result = self._execute(
-                tool,
-                arguments,
-            )
-
-            self._print_result(
-                tool,
-                result,
-            )
-
-            self.state.phase = (
-                "replanning"
-            )
-
-            # --------------------------------------------------------
-            # Successful action
-            # --------------------------------------------------------
-
-            if result.get("ok"):
-
-                # Once a source read completes, immediately move the
-                # controller into WRITE phase for compound tasks.
-                if (
-                    tool == "read_file"
-                    and self.required_write
-                    and self._read_complete()
-                    and not self._write_complete()
-                ):
-
-                    hint = (
-                        "SOURCE READ COMPLETE.\n"
-                        "Do not read the source "
-                        "again.\n"
-                        "Generate the requested "
-                        "transformation from the "
-                        "source content already "
-                        "present in context and "
-                        "write it now.\n\n"
-                        + self._controller_hint()
-                    )
-
-                elif (
-                    tool
-                    in {
-                        "write_file",
-                        "append_file",
-                    }
-                    and self._write_complete()
-                ):
-
-                    # Verification is controller-owned in _execute().
-                    # Granite does not need another read loop.
-                    verification = (
-                        result.get(
-                            "controller_verification",
-                            {},
-                        )
-                    )
-
-                    verified = (
-                        isinstance(
-                            verification,
-                            dict,
-                        )
-                        and verification.get(
-                            "ok"
-                        )
-                        is True
-                    )
-
-                    if verified:
-
-                        target = (
-                            arguments.get(
-                                "path"
-                            )
-                            or self.target_write_path
-                            or "output file"
-                        )
-
-                        answer = (
-                            f"Created {target}"
-                        )
-
-                        self.state.completed = (
-                            True
-                        )
-
-                        self.state.final_answer = (
-                            answer
-                        )
-
-                        self.state.verification = (
-                            "write succeeded and "
-                            "controller read-back "
-                            "verification succeeded."
-                        )
-
-                        self.memory.remember_task(
-                            objective,
-                            answer,
-                        )
-
-                        logger.info(
-                            "TASK COMPLETE: "
-                            "controller verified "
-                            "write"
-                        )
-
-                        print(
-                            "\n"
-                            + answer
-                        )
-
-                        print(
-                            "\nVerification: "
-                            + self.state.verification
-                        )
-
-                        return answer
-
-                    hint = (
-                        "The write succeeded but "
-                        "controller verification "
-                        "did not succeed. "
-                        "Inspect or repair the "
-                        "output without repeating "
-                        "the source read."
-                    )
-
-                elif (
-                    tool
-                    == "curl_internet"
-                ):
-
-                    if (
-                        self.required_write
-                        and not self._write_complete()
-                    ):
-
-                        hint = (
-                            "NETWORK FETCH COMPLETE.\n"
-                            "Use the fetched body "
-                            "already present in "
-                            "context and write the "
-                            "requested output file.\n\n"
-                            + self._controller_hint()
-                        )
-
-                    else:
-
-                        hint = (
-                            "Network fetch "
-                            "succeeded. Use the "
-                            "verified fetched "
-                            "content and return "
-                            "complete."
-                        )
-
+                signature = json.dumps(action.__dict__, sort_keys=True, default=str, ensure_ascii=False)
+                if signature == last_signature:
+                    nonprogress += 1
+                    hint = "Repeated action blocked. Choose a different action that advances the workflow."
+                    logger.warning("MODEL LOOP DETECTED: %s", signature)
                 else:
+                    last_signature = signature
+                    if action.is_complete:
+                        valid, reason = self.workflow.completion_valid(self.state, action.answer)
+                        if valid:
+                            self.state.completed = True
+                            self.state.final_answer = action.answer
+                            self.state.verification = action.verification
+                            self.memory.remember_task(self.state.objective, action.answer)
+                            logger.info("TASK COMPLETE")
+                            print("\n" + action.answer)
+                            return action.answer
+                        nonprogress += 1
+                        hint = reason
+                    elif action.action not in allowed:
+                        nonprogress += 1
+                        hint = f"Tool {action.action!r} is forbidden. Choose only from {sorted(allowed)}."
+                        logger.warning("TOOL BLOCKED BY WORKFLOW: %s", action.action)
+                    else:
+                        arguments = dict(action.arguments)
+                        if action.action in {"write_file", "append_file"} and self.requirements.output_path:
+                            arguments["path"] = self.requirements.output_path
+                        result = self._execute(action.action, arguments)
+                        self._print_result(action.action, result)
+                        if result.get("ok"):
+                            nonprogress = 0
+                            if action.action in {"write_file", "append_file"}:
+                                path = str(arguments.get("path", ""))
+                                if path:
+                                    completed = self._complete_verified_write(path)
+                                    if completed:
+                                        return completed
+                            hint = "Previous operation succeeded. Continue with the next required phase."
+                        else:
+                            nonprogress += 1
+                            hint = f"Previous operation failed: {result.get('error', 'unknown error')}"
 
-                    hint = (
-                        "Previous operation "
-                        "succeeded.\n"
-                        + self._controller_hint()
-                    )
-
-            # --------------------------------------------------------
-            # Failed action
-            # --------------------------------------------------------
-
-            else:
-
-                hint = (
-                    "Previous operation failed:\n"
-                    + str(
-                        result.get(
-                            "error",
-                            "unknown error",
-                        )
-                    )
-                    + "\n\n"
-                    + self._controller_hint()
-                )
-
-            # --------------------------------------------------------
-            # User interrupt
-            # --------------------------------------------------------
-
+            if nonprogress >= self.config.max_nonprogress_iterations:
+                logger.warning("TASK ABORTED AFTER %s NON-PROGRESS ITERATIONS", nonprogress)
+                break
             if not self._interrupt():
                 break
 
-        # ============================================================
-        # STOPPED WITHOUT COMPLETION
-        # ============================================================
-
-        logger.warning(
-            "TASK STOPPED WITHOUT "
-            "VERIFIED COMPLETION"
-        )
-
-        message = (
-            "Task stopped without "
-            "verified completion."
-        )
-
-        print(
-            "\n"
-            + message
-        )
-
+        logger.warning("TASK STOPPED WITHOUT VERIFIED COMPLETION")
+        message = "Task stopped without verified completion."
+        print("\n" + message)
         return message
+
+    def run(self, objective: str) -> str:
+        self._reset(objective.strip())
+        assert self.state is not None
+        logger.info("=" * 72)
+        logger.info("GRANITE CODE AGENT TASK | session=%s", self.session_id)
+        logger.info("Objective: %s", self.state.objective)
+        logger.info("Workspace: %s", self.config.workspace)
+        logger.info("Requirements: %s", self.requirements)
+        logger.info("=" * 72)
+
+        direct = parse_direct_call(self.state.objective) or natural_direct(self.state.objective)
+        if direct is not None:
+            logger.info("DIRECT ROUTER: %s %s", direct.tool, json.dumps(direct.arguments, ensure_ascii=False))
+            return self._run_direct(direct)
+
+        # Literal writes are fully deterministic: no inference is needed.
+        if self.requirements.write and self.requirements.output_path and self.requirements.literal_content is not None and not self.requirements.read and not self.requirements.web:
+            completed = self._write_generated_content()
+            return completed or self._autonomous_loop("Deterministic literal write failed.")
+
+        # Mutation-only tasks with a known target use Granite only for content
+        # generation; Python owns the exact tool and exact path.
+        if self.requirements.write and self.requirements.output_path and not self.requirements.read and not self.requirements.web:
+            completed = self._write_generated_content()
+            return completed or self._autonomous_loop("Content generation/write failed.")
+
+        # Compound local transformations: Python reads; Granite transforms;
+        # Python writes and verifies. Granite never decides tool sequencing.
+        if self.requirements.read and self.requirements.source_path:
+            logger.info("CONTROLLER SOURCE ROUTE: %s", self.requirements.source_path)
+            result = self._read_source_pages(self.requirements.source_path)
+            if not result.get("ok"):
+                return self._autonomous_loop(initial_hint=f"Controller source read failed: {result.get('error')}")
+            if self.requirements.write and self.requirements.output_path:
+                source_text = self._verified_source_text("read_file", "content")
+                completed = self._write_generated_content(source_text)
+                return completed or self._autonomous_loop("Transform/write failed.")
+            return self._verified_source_text("read_file", "content") or self._simple_answer("read_file", result)
+
+        # Web retrieval is deterministic when the task supplies a URL or asks
+        # for news. This avoids asking Granite which tool to call.
+        if self.requirements.web:
+            result = self._fetch_web_source()
+            if not result.get("ok"):
+                return self._autonomous_loop(initial_hint=f"Controller web fetch failed: {result.get('error')}")
+            body = str(result.get("body", ""))
+            if self.requirements.write and self.requirements.output_path:
+                completed = self._write_generated_content(body)
+                return completed or self._autonomous_loop("Web transform/write failed.")
+            if re.search(r"\b(news|latest|recent)\b", self.state.objective, flags=re.I):
+                headlines = self._rss_headlines(body)
+                if headlines:
+                    self.state.completed = True
+                    self.state.final_answer = headlines
+                    self.state.verification = f"Fetched {result.get('url')} successfully"
+                    self.memory.remember_task(self.state.objective, headlines[:2000])
+                    logger.info("TASK COMPLETE: deterministic RSS extraction")
+                    print("\n" + headlines)
+                    return headlines
+            return body
+
+        return self._autonomous_loop()
