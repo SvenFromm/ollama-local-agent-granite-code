@@ -20,9 +20,7 @@ The aim was to read files locally for further analysis, without the need to uplo
 - the first code was one large python file, to which logging and unit testing have been added for debugging purposes, but which has ultimately been rewritten in a modular manner
 - in the end the agent was optimized for granite-code:3b with 16k context, exposing the following tools to the model:
 
-========================================================================
- AVAILABLE TOOLS
-========================================================================
+**AVAILABLE TOOLS**
 
 FILES
   append_file(path: 'str', content: 'str') -> 'dict[str, Any]'
@@ -44,4 +42,3 @@ SYSTEM
 
 Use a tool by describing the task normally; direct commands such as
 read_file(path) and list_files(.) are routed without an LLM call.
-========================================================================
