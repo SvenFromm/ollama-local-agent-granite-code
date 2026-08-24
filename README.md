@@ -20,25 +20,41 @@ The aim was to read files locally for further analysis, without the need to uplo
 - the first code was one large python file, to which logging and unit testing have been added for debugging purposes, but which has ultimately been rewritten in a modular manner
 - in the end the agent was optimized for granite-code:3b with 16k context, exposing the following tools to the model:
 
-**AVAILABLE TOOLS**
+## AVAILABLE TOOLS
 
-FILES
-  append_file(path: 'str', content: 'str') -> 'dict[str, Any]'
-      Append text to a file; use only when append semantics are required.
-  list_files(path: 'str' = '.', recursive: 'bool' = False) -> 'dict[str, Any]'
-      List files/directories inside the workspace.
-  read_file(path: 'str', start_line: 'int' = 1, end_line: 'int' = 800) -> 'dict[str, Any]'
-      Read a UTF-8 text file with optional line range.
-  write_file(path: 'str', content: 'str') -> 'dict[str, Any]'
-      Create or replace a text file.
+**FILES**
+  - append_file(path: 'str', content: 'str') -> 'dict[str, Any]'
+    --  Append text to a file; use only when append semantics are required.
+  - list_files(path: 'str' = '.', recursive: 'bool' = False) -> 'dict[str, Any]'
+    --  List files/directories inside the workspace.
+  - read_file(path: 'str', start_line: 'int' = 1, end_line: 'int' = 800) -> 'dict[str, Any]'
+    --  Read a UTF-8 text file with optional line range.
+  - write_file(path: 'str', content: 'str') -> 'dict[str, Any]'
+    --  Create or replace a text file.
 
-NETWORK
-  curl_internet(url: 'str', timeout: 'int' = 30) -> 'dict[str, Any]'
-      Fetch an HTTP/HTTPS URL.
+**NETWORK**
+  - curl_internet(url: 'str', timeout: 'int' = 30) -> 'dict[str, Any]'
+    --  Fetch an HTTP/HTTPS URL.
 
-SYSTEM
-  run_shell(command: 'str') -> 'dict[str, Any]'
-      Run a shell command from the workspace.
+**SYSTEM**
+  - run_shell(command: 'str') -> 'dict[str, Any]'
+    --  Run a shell command from the workspace.
 
 Use a tool by describing the task normally; direct commands such as
 read_file(path) and list_files(.) are routed without an LLM call.
+
+
+## AI-Assisted Development
+
+This project was developed with assistance from OpenAI's ChatGPT.
+
+ChatGPT was used during development for code generation, debugging,
+architectural refinement, documentation, and analysis of test results.
+The generated code was subsequently reviewed, tested, modified, and
+integrated by the repository author.
+
+The runtime agent itself does not depend on OpenAI services or APIs.
+It is designed to operate locally using Ollama and IBM Granite Code models.
+
+OpenAI and ChatGPT are not affiliated with, sponsors of, or endorsers
+of this project.
